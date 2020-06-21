@@ -2,23 +2,97 @@
 # Copyright (c) 2013-2017 David Dotson, Ricky Sexton, Armin Zjajo, Oliver Beckstein
 # Released under the GNU General Public License v3+
 
-from __future__ import print_function
-
-from six import string_types
 import os
-from six import StringIO
+from io import StringIO
 
 import pandas as pd
 import numpy as np
 
 import propka.run as pk
 import MDAnalysis as mda
+from MDAnalysis.analysis.base import AnalysisBase
 
+import warnings
 import logging
 
+
+class ProkpaTraj(AnalysisBase):
+    def __init__(self, atomgroup, ,skip_failure=False, **kwargs):
+        """Init routine for the PropkaTraj class
+
+        Parameters
+        ----------
+        atomgroup : :class:`MDAnalysis.Universe` or
+                    :class:`MDAnalysis.AtomgGroup`
+            Part of the system to obtain pKas for.
+        skip_failure : bool
+            If set to ``True``, skip frames where PROPKA fails. If ``False``
+            raise an exception. The default is ``False``.
+            Log file (at level warning) contains information on failed frames.
+
+        Results
+        -------
+        pkas : :class:`pandas.DataFrame`
+            DataFrame giving estimated pKa value for each residue for each
+            trajectory frame. Residue numbers are given as column labels,
+            times as row labels.
+
+        """
+
+        # store input atomgroup as atomgroup
+        self.ag = atomgroup.atoms
+        # temporary file to write to
+        self.tmpfile = os.path.join(os.path.dirname(ag.universe.filename),
+                                    'current.pdb')
+
+    def _setup_frames(self, trajectory, start=None, stop=None, step=None):
+        super(ProkpaTraj, self)._setup_frames(trajectory, start, stop, step)
+        # Container to store pkas
+        self.pkas = []
+        self.num_failed_frames = 0
+        self.failed_frames = []
+
+    def _single_frame(self):
+        pstream = mda.lib.util.NamedStream(StringIO(), self.tmpfile)
+        self.ag.write(pstream)
+
+        pstream.reset() # reset for reading
+
+        try:
+            mol = pk.single(pstream, optargs=['--quiet'])
+        except (IndexError, AttributeError) as err:
+            if not skip_failure:
+                raise
+            else:
+                errmsg = f"failure on frame: {self._ts.frame}"
+                warnings.warn(errmsg)
+                self.num_failed_frames += 1
+                self.failed_frames.append(self._ts.frame)
+        finally:
+            pstream.close(force=True)  # deallocate
+
+        confname = mol.conformation_names[0]
+        conformation = mol.conformations[confname]
+        groups = conformation.get_titratable_groups()
+
+        # extract pka estimates from each residue
+        self.pkas.append([g.pka_value for g in groups])
+
+    def _conclude(self):
+        # Ouput failed frames
+        if self.num_failed_frames > 0:
+            perc_failure = (self.num_failed_frames / self.n_frames) * 100
+            wmsg = (f"number of failed frames = {self.num_failed_frames}\n"
+                    f"percentage failure = {perc_failure}")
+                    f"failed frames: {self.failed_frames_log}")
+            warnings.warn(wmsg)
+        
+        self.df = pd.DataFrame(pkas, index=pd.Float64Index(self.times, 
+               name='time'), columns=[g.atom.resNumb for g in groups])
+
+        
 def get_propka(universe, sel='protein', start=None, stop=None, step=None, skip_failure=False):
     """Get and store pKas for titrateable residues near the binding site.
-
     Parameters
     ----------
     universe : :class:`MDAnalysis.Universe`
@@ -37,14 +111,12 @@ def get_propka(universe, sel='protein', start=None, stop=None, step=None, skip_f
         If set to ``True``, skip frames where PROPKA fails. If ``False``
         raise an exception. The default is ``False``.
         Log file (at level warning) contains information on failed frames.
-
     Results
     -------
     pkas : :class:`pandas.DataFrame`
         DataFrame giving estimated pKa value for each residue for each
         trajectory frame. Residue numbers are given as column labels, times as
         row labels.
-
     """
    
     # need AtomGroup to write out for propka
